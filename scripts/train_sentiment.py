@@ -32,7 +32,8 @@ DATASET_DIR  = os.path.join(SCRIPT_DIR, "datasets")
 CSV_PATH     = os.path.join(DATASET_DIR, "openreview_labeled_2k.csv")
 OUTPUT_DIR   = os.path.join(DATASET_DIR, "distilbert_sentiment")
 
-BASE_MODEL   = "distilbert-base-uncased"
+_MLM_PRETRAINED = os.path.join(DATASET_DIR, "distilbert_commit_mlm")
+BASE_MODEL = _MLM_PRETRAINED if os.path.isdir(_MLM_PRETRAINED) else "distilbert-base-uncased"
 
 # ─── LABEL SCHEME ─────────────────────────────────────────────────────────────
 
@@ -93,6 +94,92 @@ def load_openreview(csv_path: str) -> tuple[list[str], list[int]]:
     return messages, label_ids
 
 
+# ─── DATA AUGMENTATION ────────────────────────────────────────────────────────
+
+def augment_with_nlpaug(
+    messages: list[str], labels: list[int]
+) -> tuple[list[str], list[int]]:
+    """
+    Returns new (augmented) samples via contextual word embedding substitution.
+    Uses distilbert-base-uncased as the substitution model (15% token swap).
+    Falls back gracefully if nlpaug is not installed.
+    """
+    try:
+        import nlpaug.augmenter.word as naw
+    except ImportError:
+        print("  [nlpaug] not installed — skipping (pip install nlpaug)")
+        return [], []
+
+    aug = naw.ContextualWordEmbsAug(
+        model_path="distilbert-base-uncased",
+        action="substitute",
+        aug_p=0.15,
+        device="cpu",
+    )
+
+    aug_msgs, aug_labels = [], []
+    print(f"  nlpaug: augmenting {len(messages)} samples...")
+    for msg, label in zip(messages, labels):
+        try:
+            result = aug.augment(msg)
+            aug_msgs.append(result[0] if isinstance(result, list) else result)
+            aug_labels.append(label)
+        except Exception:
+            pass
+
+    print(f"  nlpaug: +{len(aug_msgs)} samples generated")
+    return aug_msgs, aug_labels
+
+
+def back_translate(
+    messages: list[str], labels: list[int]
+) -> tuple[list[str], list[int]]:
+    """
+    Returns back-translated samples via MarianMT (en→de→en).
+    Downloads Helsinki-NLP models on first call (~300 MB each).
+    Falls back gracefully if models are unavailable.
+    """
+    try:
+        import torch
+        from transformers import MarianMTModel, MarianTokenizer
+    except ImportError:
+        print("  [back-translation] transformers/torch not installed — skipping")
+        return [], []
+
+    print("  back-translation: loading MarianMT en↔de models...")
+    en2de_name = "Helsinki-NLP/opus-mt-en-de"
+    de2en_name = "Helsinki-NLP/opus-mt-de-en"
+
+    tok_en2de = MarianTokenizer.from_pretrained(en2de_name)
+    mdl_en2de = MarianMTModel.from_pretrained(en2de_name)
+    tok_de2en = MarianTokenizer.from_pretrained(de2en_name)
+    mdl_de2en = MarianMTModel.from_pretrained(de2en_name)
+
+    def translate(texts, tokenizer, model):
+        inputs = tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH
+        )
+        with torch.no_grad():
+            out = model.generate(**inputs)
+        return [tokenizer.decode(t, skip_special_tokens=True) for t in out]
+
+    BATCH = 32
+    bt_msgs = []
+    print(f"  back-translation: translating {len(messages)} samples (batch={BATCH})...")
+    for i in range(0, len(messages), BATCH):
+        batch = messages[i : i + BATCH]
+        try:
+            de = translate(batch, tok_en2de, mdl_en2de)
+            en = translate(de, tok_de2en, mdl_de2en)
+            bt_msgs.extend(en)
+        except Exception as e:
+            print(f"    [warn] batch {i // BATCH} failed: {e}")
+            bt_msgs.extend(batch)
+
+    print(f"  back-translation: +{len(bt_msgs)} samples generated")
+    return bt_msgs, list(labels)
+
+
 # ─── TRAINING ─────────────────────────────────────────────────────────────────
 
 def train():
@@ -132,6 +219,14 @@ def train():
     )
     print(f"  Train: {len(train_msgs)}  |  Val: {len(val_msgs)}")
 
+    # ── Data augmentation (training split only) ───────────────────────────────
+    print("\n[1b/4] Augmenting training data...")
+    nlp_msgs, nlp_labels = augment_with_nlpaug(train_msgs, train_labels)
+    bt_msgs,  bt_labels  = back_translate(train_msgs, train_labels)
+    train_msgs   = train_msgs   + nlp_msgs   + bt_msgs
+    train_labels = train_labels + nlp_labels + bt_labels
+    print(f"  Final training set: {len(train_msgs)} samples")
+
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     print(f"\n[2/4] Loading tokenizer ({BASE_MODEL})...")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
@@ -166,6 +261,26 @@ def train():
         label2id=LABEL2ID,
     )
 
+    # ── LoRA (optional — reduces overfitting risk on 2k samples) ──────────────
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+        lora_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_lin", "v_lin"],  # DistilBERT attention projections
+            lora_dropout=0.1,
+            bias="none",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        _use_lora = True
+        print("  [LoRA] enabled — training adapter weights only")
+    except ImportError:
+        _use_lora = False
+        print("  [LoRA] peft not installed — full fine-tuning")
+        print("  Install with: pip install peft")
+
     # ── Training ──────────────────────────────────────────────────────────────
     print(f"\n[4/4] Fine-tuning for {NUM_EPOCHS} epochs...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -194,8 +309,8 @@ def train():
         learning_rate=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
         eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
+        save_strategy="no" if _use_lora else "epoch",
+        load_best_model_at_end=False if _use_lora else True,
         metric_for_best_model="f1_macro",
         logging_steps=20,
         report_to="none",       # disable wandb/mlflow
@@ -214,12 +329,7 @@ def train():
 
     trainer.train()
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    print(f"\nSaving fine-tuned model to: {OUTPUT_DIR}")
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-
-    # ── Final evaluation ──────────────────────────────────────────────────────
+    # ── Final evaluation (before merge so trainer.model still valid) ──────────
     print("\nFinal evaluation on validation set:")
     preds_out = trainer.predict(val_ds)
     preds     = np.argmax(preds_out.predictions, axis=-1)
@@ -228,6 +338,16 @@ def train():
         target_names=LABELS,
         zero_division=0,
     ))
+
+    # ── Merge LoRA weights into base model before saving ──────────────────────
+    if _use_lora:
+        print("  Merging LoRA adapter weights into base model...")
+        model = model.merge_and_unload()
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    print(f"\nSaving fine-tuned model to: {OUTPUT_DIR}")
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
 
     print("\n" + "=" * 60)
     print("  Training complete.")
