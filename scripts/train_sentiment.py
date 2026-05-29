@@ -32,8 +32,8 @@ DATASET_DIR  = os.path.join(SCRIPT_DIR, "datasets")
 CSV_PATH     = os.path.join(DATASET_DIR, "openreview_labeled_2k.csv")
 OUTPUT_DIR   = os.path.join(DATASET_DIR, "distilbert_sentiment")
 
-_MLM_PRETRAINED = os.path.join(DATASET_DIR, "distilbert_commit_mlm")
-BASE_MODEL = _MLM_PRETRAINED if os.path.isdir(_MLM_PRETRAINED) else "distilbert-base-uncased"
+_ADAPTED_MODEL = os.path.join(DATASET_DIR, "distilbert_adapted")
+BASE_MODEL = _ADAPTED_MODEL if os.path.isdir(_ADAPTED_MODEL) else "distilbert-base-uncased"
 
 # ─── LABEL SCHEME ─────────────────────────────────────────────────────────────
 
@@ -141,9 +141,11 @@ def back_translate(
     """
     try:
         import torch
+        import sentencepiece  # noqa: F401 — required by MarianTokenizer
         from transformers import MarianMTModel, MarianTokenizer
     except ImportError:
-        print("  [back-translation] transformers/torch not installed — skipping")
+        print("  [back-translation] sentencepiece not installed — skipping")
+        print("  Install with: pip install sentencepiece")
         return [], []
 
     print("  back-translation: loading MarianMT en↔de models...")

@@ -3,17 +3,17 @@
 #
 # Layer 1: DistilBERT fine-tuned on OpenReview 2025 (2,000 labeled commit messages)
 #          Labels: Satisfaction | Frustration | Caution | Neutral
-#          Sentiment Score per file = (Frustration + Caution) / total commits
+#          Sentiment Score per file = mean of P(frustration)+P(caution) over commits
 #
 # Layer 2: Lizard static analysis — AvgCCN, AvgNLOC, function_cnt, PARAM
 #          Complexity Score = percentile rank of AvgCCN within this repo
 #
 # Layer 3: Logistic Regression trained on DeepJIT (6 projects) + ApacheJIT (14 projects)
-#          Input: [Sentiment Score, Low-Info Ratio, Change Entropy, SATD Density]
+#          Input: [sentiment_score, low_info_ratio, change_entropy, satd_density, lt_normalized]
 #          Output: Risk Score (0–1 probability of being bug-prone)
 #          SMOTE-Tomek resampling corrects class imbalance before fitting.
-#          Structural complexity (Lizard) is a separate display metric — not an LR input
-#          because it cannot be computed from training datasets (no source code).
+#          lt_normalized: percentile rank of LT (lines before change) in training;
+#          AvgNLOC percentile rank at runtime — both measure file size relative to repo.
 #
 # Layer 4: SHAP LinearExplainer — decomposes Risk Score into per-feature contributions
 #
@@ -164,78 +164,76 @@ def load_sentiment_model():
     return classifier
 
 
-def classify_message(message: str, classifier) -> str:
+def classify_message(message: str, classifier) -> tuple[str, float]:
     """
-    Classifies a single commit message using the fine-tuned DistilBERT model.
+    Classifies a single commit message.
 
-    Prefixes are stripped before classification for consistency with training.
+    Returns (label, risk_probability) where risk_probability is the sum of
+    P(frustration) and P(caution) from the softmax output. Using a continuous
+    probability rather than a hard 0/1 flag keeps training and runtime on the
+    same feature scale: runtime sentiment_score is the mean of these probabilities
+    over a file's commits, so training should produce values in the same range.
     """
     stripped = strip_prefix(message)
     if not stripped:
-        return "neutral"
+        return "neutral", 0.0
 
-    # pipeline returns list of lists when top_k=None: [[{label, score}, ...]]
-    results = classifier(stripped[:512])[0]  # truncate safety; model also truncates
+    results = classifier(stripped[:512])[0]
+
     best = max(results, key=lambda x: x["score"])
-    label = best["label"].lower()
-
-    # Normalize label to expected scheme in case model saved with capitalized labels
-    label = label.replace("label_", "")  # handle HF auto-labeling e.g. "LABEL_0"
+    label = best["label"].lower().replace("label_", "")
     if label not in VALID_LABELS:
-        # Fall back: pick closest known label by string match
         for known in VALID_LABELS:
             if known in label:
-                return known
-        return "neutral"
+                label = known
+                break
+        else:
+            label = "neutral"
 
-    return label
+    # Sum of softmax mass on the two risk classes — stays continuous in [0, 1].
+    risk_prob = sum(
+        r["score"]
+        for r in results
+        if r["label"].lower().replace("label_", "") in RISK_LABELS
+    )
+    return label, float(risk_prob)
 
 
 def compute_sentiment_score(
     messages: list[str], classifier
-) -> tuple[float, float, list[tuple[str, str]]]:
+) -> tuple[float, float, list[tuple[str, str, float]]]:
     """
     Processes a list of commit messages for a file.
 
-    1. Identifies low-information messages (tokens < 5).
-    2. low_info_ratio = low_info_count / total_commits
-    3. Sentiment Score = (frustration + caution) / (total_commits - low_info_count)
-       (If all commits are low-info, sentiment_score is 0.0)
+    sentiment_score = mean of P(frustration)+P(caution) over non-low-info commits.
+    This is a continuous value in [0, 1] matching what training produces
+    (mean soft probability per commit), removing the binary-vs-ratio mismatch.
 
-    Returns (sentiment_score, low_info_ratio, [(message, label), ...]).
+    Returns (sentiment_score, low_info_ratio, [(message, label, risk_prob), ...]).
     """
     if not messages:
         return 0.0, 0.0, []
 
     total_count = len(messages)
-    low_info_msgs = [m for m in messages if is_low_info(m)]
-    low_info_ratio = len(low_info_msgs) / total_count
+    low_info_flags = [is_low_info(m) for m in messages]
+    low_info_ratio = sum(low_info_flags) / total_count
 
-    # DistilBERT is only asked to classify non-low-info messages
-    process_msgs = [m for m in messages if not is_low_info(m)]
+    process_msgs = [m for m, li in zip(messages, low_info_flags) if not li]
 
     if not process_msgs:
-        return 0.0, low_info_ratio, [(m, "low_info") for m in messages]
+        return 0.0, low_info_ratio, [(m, "low_info", 0.0) for m in messages]
 
-    labeled = [(msg, classify_message(msg, classifier)) for msg in process_msgs]
-    risk_count = sum(1 for _, label in labeled if label in RISK_LABELS)
-    sentiment_score = risk_count / len(process_msgs)
+    labeled = [(msg, *classify_message(msg, classifier)) for msg in process_msgs]
+    sentiment_score = float(np.mean([prob for _, _, prob in labeled]))
 
-    # Combine for display/return
     final_labeled = []
-    # Re-assemble labeled list to preserve original count/order if possible,
-    # but here we just return them labeled.
-    for m in messages:
-        if is_low_info(m):
-            final_labeled.append((m, "low_info"))
+    risk_iter = iter(labeled)
+    for m, li in zip(messages, low_info_flags):
+        if li:
+            final_labeled.append((m, "low_info", 0.0))
         else:
-            # find its label from the labeled list
-            label = "neutral"
-            for msg, lbl in labeled:
-                if msg == m:
-                    label = lbl
-                    break
-            final_labeled.append((m, label))
+            msg, lbl, prob = next(risk_iter)
+            final_labeled.append((m, lbl, prob))
 
     return sentiment_score, low_info_ratio, final_labeled
 
@@ -302,18 +300,17 @@ def percentile_rank(value: float, all_values: list[float]) -> float:
 
 def _load_deepjit_records(sentiment_clf) -> list[dict]:
     """
-    Loads all available DeepJIT pkl files (up to 6 projects).
-    Each pkl contains: [hashes, labels, messages, code_changes].
+    Loads DeepJIT pkl records. Two changes from the previous version:
 
-    For each project, the companion *_k_feature.csv is loaded if present —
-    it contains per-commit entropy keyed by commit hash. Entropy is
-    percentile-ranked within each project for repo-relative normalisation.
+    1. Reads `lt` (lines of code before the change) from the k_feature CSV
+       in addition to `entrophy`. lt is percentile-ranked within each project
+       so the scale matches the AvgNLOC percentile rank used at runtime.
+       ApacheJIT has no equivalent column, so lt_normalized is NaN there and
+       imputed with the cross-project mean in train_risk_model.
 
-    Missing entropy (no CSV, or hash absent from CSV) is stored as np.nan.
-    train_risk_model() imputes NaN values with the column mean over all
-    records that have observed entropy (SimpleImputer, strategy='mean').
-
-    Records from missing pkl files are skipped with a warning.
+    2. sentiment_score is now the soft risk probability P(frustration)+P(caution)
+       from DistilBERT rather than a hard 0/1 flag, matching the continuous
+       value that compute_sentiment_score produces at runtime.
     """
     records = []
     for pkl_path in DEEPJIT_PKLS:
@@ -330,47 +327,70 @@ def _load_deepjit_records(sentiment_clf) -> list[dict]:
 
         feature_csv = pkl_path.replace("_test_raw.pkl", "_k_feature.csv")
         ent_by_hash: dict[str, float] = {}
+        lt_by_hash:  dict[str, float] = {}
+
         if os.path.isfile(feature_csv):
             with open(feature_csv, newline="", encoding="utf-8") as f:
                 for row in csv.DictReader(f):
+                    h = row.get("_id", "")
                     try:
-                        ent_by_hash[row["_id"]] = float(row["entrophy"])
+                        ent_by_hash[h] = float(row["entrophy"])
+                    except (ValueError, KeyError):
+                        pass
+                    try:
+                        lt_by_hash[h] = float(row["lt"])
                     except (ValueError, KeyError):
                         pass
 
         all_ent = list(ent_by_hash.values())
+        all_lt  = list(lt_by_hash.values())
         has_entropy = bool(all_ent)
-        # Project-mean percentile rank used to impute commits whose hash is absent
-        # from the k_feature CSV (within-project mean imputation).
-        project_mean_rank = (
+        has_lt      = bool(all_lt)
+
+        project_mean_ent_rank = (
             percentile_rank(float(np.mean(all_ent)), all_ent) if has_entropy else np.nan
         )
-        print(f"    DeepJIT [{project}]: {len(labels)} commits  "
-              f"(entropy: {'yes' if has_entropy else 'no — NaN, will impute'})")
+        project_mean_lt_rank = (
+            percentile_rank(float(np.mean(all_lt)), all_lt) if has_lt else np.nan
+        )
+
+        print(
+            f"    DeepJIT [{project}]: {len(labels)} commits  "
+            f"(entropy: {'yes' if has_entropy else 'no'}  "
+            f"lt: {'yes' if has_lt else 'no'})"
+        )
 
         for h, msg, label in zip(hashes, messages, labels):
-            low_info = 1.0 if is_low_info(msg) else 0.0
+            low_info     = is_low_info(msg)
+            low_info_val = 1.0 if low_info else 0.0
 
             if low_info:
                 sentiment_score = 0.0
             else:
-                emotion = classify_message(msg, sentiment_clf)
-                sentiment_score = 1.0 if emotion in RISK_LABELS else 0.0
+                _, risk_prob    = classify_message(msg, sentiment_clf)
+                sentiment_score = risk_prob  # continuous [0, 1]
 
             if has_entropy and h in ent_by_hash:
                 change_entropy = percentile_rank(ent_by_hash[h], all_ent)
             elif has_entropy:
-                # Hash absent from CSV but project has entropy data: within-project mean.
-                change_entropy = project_mean_rank
+                change_entropy = project_mean_ent_rank
             else:
-                change_entropy = np.nan  # imputed at training level
+                change_entropy = np.nan
+
+            if has_lt and h in lt_by_hash:
+                lt_normalized = percentile_rank(lt_by_hash[h], all_lt)
+            elif has_lt:
+                lt_normalized = project_mean_lt_rank
+            else:
+                lt_normalized = np.nan
 
             records.append({
                 "sentiment_score": sentiment_score,
-                "low_info_ratio": low_info,
-                "change_entropy": change_entropy,
-                "satd_density": compute_msg_satd_density(msg),
-                "buggy": int(label),
+                "low_info_ratio":  low_info_val,
+                "change_entropy":  change_entropy,
+                "satd_density":    compute_msg_satd_density(msg),
+                "lt_normalized":   lt_normalized,
+                "buggy":           int(label),
             })
 
     return records
@@ -378,14 +398,8 @@ def _load_deepjit_records(sentiment_clf) -> list[dict]:
 
 def _load_apachejit_records(sentiment_clf) -> tuple[list[dict], list[dict]]:
     """
-    Loads ApacheJIT commits from apachejit_commits.csv.
-    Applies an 80/20 split: training records and held-out validation records.
-
-    ApacheJIT ships no source code and no per-commit entropy file, so
-    change_entropy is stored as np.nan and imputed by train_risk_model()
-    using the mean of observed entropy values from DeepJIT records.
-
-    Expected CSV columns: commit_hash, message, buggy
+    ApacheJIT has no k_feature CSV, so lt_normalized is NaN for every record.
+    sentiment_score is now the soft risk probability, consistent with DeepJIT.
     """
     if not os.path.isfile(APACHEJIT_CSV):
         print(f"    [skip] ApacheJIT CSV not found: {APACHEJIT_CSV}")
@@ -404,28 +418,27 @@ def _load_apachejit_records(sentiment_clf) -> tuple[list[dict], list[dict]]:
 
     print(f"    ApacheJIT: {len(rows)} commits loaded")
 
-    # Stratified-ish 80/20 split (deterministic)
-    split_idx = int(len(rows) * 0.8)
+    split_idx  = int(len(rows) * 0.8)
     train_rows = rows[:split_idx]
     val_rows   = rows[split_idx:]
 
     def rows_to_records(row_list):
         recs = []
         for msg, buggy in row_list:
-            low_info = 1.0 if is_low_info(msg) else 0.0
-
+            low_info     = is_low_info(msg)
+            low_info_val = 1.0 if low_info else 0.0
             if low_info:
                 sentiment_score = 0.0
             else:
-                emotion = classify_message(msg, sentiment_clf)
-                sentiment_score = 1.0 if emotion in RISK_LABELS else 0.0
-
+                _, risk_prob    = classify_message(msg, sentiment_clf)
+                sentiment_score = risk_prob
             recs.append({
                 "sentiment_score": sentiment_score,
-                "low_info_ratio": low_info,
-                "change_entropy": np.nan,  # no entropy data in ApacheJIT; imputed at training level
-                "satd_density": compute_msg_satd_density(msg),
-                "buggy": buggy,
+                "low_info_ratio":  low_info_val,
+                "change_entropy":  np.nan,
+                "satd_density":    compute_msg_satd_density(msg),
+                "lt_normalized":   np.nan,   # no source code metadata in ApacheJIT
+                "buggy":           buggy,
             })
         return recs
 
@@ -436,21 +449,23 @@ def _load_apachejit_records(sentiment_clf) -> tuple[list[dict], list[dict]]:
 
 def train_risk_model(sentiment_clf) -> tuple:
     """
-    Returns (trained LR model, X_train numpy array for SHAP background).
+    Returns (trained LR model, X_train numpy array for SHAP background, fitted imputer).
 
     On first run: trains on DeepJIT + ApacheJIT with SMOTE-Tomek resampling
     and saves the result to LR_MODEL_CACHE. Subsequent runs load from cache.
     Delete LR_MODEL_CACHE to force retraining.
 
-    Feature vector: [sentiment_score, low_info_ratio, change_entropy]
-    Missing change_entropy values (np.nan) are imputed with the column mean
-    over observed values via sklearn SimpleImputer (standard mean imputation).
+    Feature vector: [sentiment_score, low_info_ratio, change_entropy, satd_density, lt_normalized]
+    NaN values (change_entropy for ApacheJIT, lt_normalized for ApacheJIT and DeepJIT
+    projects without k_feature CSV) are imputed with column means via SimpleImputer.
+    The fitted imputer is saved to cache and returned so runtime inputs can be
+    transformed on the same scale as training.
     """
     if os.path.isfile(LR_MODEL_CACHE):
         print(f"  Loading cached LR model from: {LR_MODEL_CACHE}")
         print("  (delete this file to force retraining)")
         cached = joblib.load(LR_MODEL_CACHE)
-        return cached["model"], cached["X_train"]
+        return cached["model"], cached["X_train"], cached["imputer"]
 
     print("  Loading DeepJIT records...")
     deepjit_records = _load_deepjit_records(sentiment_clf)
@@ -464,21 +479,25 @@ def train_risk_model(sentiment_clf) -> tuple:
         print("\n  ERROR: No training data available. Check dataset paths.")
         sys.exit(1)
 
+    FEATURE_NAMES = ["sentiment_score", "low_info_ratio", "change_entropy", "satd_density", "lt_normalized"]
+
     X_train = np.array([
-        [r["sentiment_score"], r["low_info_ratio"], r["change_entropy"], r["satd_density"]]
+        [r["sentiment_score"], r["low_info_ratio"], r["change_entropy"],
+         r["satd_density"],    r["lt_normalized"]]
         for r in all_train
     ], dtype=float)
     y_train = np.array([r["buggy"] for r in all_train])
 
-    # Mean imputation for change_entropy where data was unavailable (np.nan).
-    # Imputation mean is computed from observed DeepJIT entropy values only —
-    # no invented constant; the value is fully data-derived.
     from sklearn.impute import SimpleImputer
     imputer = SimpleImputer(strategy="mean")
     X_train = imputer.fit_transform(X_train)
-    entropy_mean = imputer.statistics_[2]  # index 2 = change_entropy column
-    nan_count = int(np.isnan(np.array([r["change_entropy"] for r in all_train], dtype=float)).sum())
-    print(f"  change_entropy: {nan_count} NaN values imputed with observed mean {entropy_mean:.4f}")
+
+    for i, name in enumerate(FEATURE_NAMES):
+        nan_count = int(np.isnan(
+            np.array([r[name] for r in all_train], dtype=float)
+        ).sum())
+        if nan_count:
+            print(f"  {name}: {nan_count} NaN values imputed with mean {imputer.statistics_[i]:.4f}")
 
     buggy_n = int(y_train.sum())
     print(f"  Raw training set: {len(y_train)} commits ({buggy_n} buggy, {len(y_train) - buggy_n} clean)")
@@ -496,15 +515,17 @@ def train_risk_model(sentiment_clf) -> tuple:
     model = LogisticRegression(random_state=42, max_iter=1000)
     model.fit(X_train, y_train)
 
-    print(f"  LR coef → sentiment: {model.coef_[0][0]:.4f}  "
-          f"low_info: {model.coef_[0][1]:.4f}  "
-          f"entropy: {model.coef_[0][2]:.4f}  "
-          f"satd: {model.coef_[0][3]:.4f}")
+    coef_parts = "  ".join(
+        f"{name}: {model.coef_[0][i]:.4f}"
+        for i, name in enumerate(FEATURE_NAMES)
+    )
+    print(f"  LR coef → {coef_parts}")
     print(f"  Intercept: {model.intercept_[0]:.4f}")
 
     if apache_val:
         X_val = np.array([
-            [r["sentiment_score"], r["low_info_ratio"], r["change_entropy"], r["satd_density"]]
+            [r["sentiment_score"], r["low_info_ratio"], r["change_entropy"],
+             r["satd_density"],    r["lt_normalized"]]
             for r in apache_val
         ], dtype=float)
         X_val = imputer.transform(X_val)
@@ -519,10 +540,10 @@ def train_risk_model(sentiment_clf) -> tuple:
         print(f"  Validation (ApacheJIT held-out 20%): "
               f"Precision={precision:.3f}  Recall={recall:.3f}  F1={f1:.3f}")
 
-    joblib.dump({"model": model, "X_train": X_train}, LR_MODEL_CACHE)
+    joblib.dump({"model": model, "X_train": X_train, "imputer": imputer}, LR_MODEL_CACHE)
     print(f"  LR model cached → {LR_MODEL_CACHE}")
 
-    return model, X_train
+    return model, X_train, imputer
 
 
 # ─── LAYER 4: SHAP ────────────────────────────────────────────────────────────
@@ -557,31 +578,30 @@ def compute_shap(model, X_train: np.ndarray, X_file: np.ndarray) -> dict:
         )
 
     return {
-        "base_rate":         float(base),
-        "sentiment_contrib": float(sv[0]),
-        "low_info_contrib":  float(sv[1]),
-        "entropy_contrib":   float(sv[2]),
-        "satd_contrib":      float(sv[3]),
+        "base_rate":          float(base),
+        "sentiment_contrib":  float(sv[0]),
+        "low_info_contrib":   float(sv[1]),
+        "entropy_contrib":    float(sv[2]),
+        "satd_contrib":       float(sv[3]),
+        "complexity_contrib": float(sv[4]),
     }
 
 
 
 # ─── GIT HISTORY (6-month window) ─────────────────────────────────────────────
 
-def get_repo_git_stats(repo_path: str) -> dict:
+def get_repo_git_stats(repo_path: str) -> tuple[dict, str]:
     """
-    Collects git history for the 6-month analysis window (ANALYSIS_WINDOW_DAYS).
+    Collects git history for the most recent ANALYSIS_WINDOW_DAYS of the repo.
 
-    Per the thesis runtime spec:
-      - Default commit window: 6 months per file
-      - Files with < 10 commits are flagged as low confidence
+    Window anchor: latest commit timestamp in the repo, not wall-clock now.
+    This ensures archived or infrequently-pushed repos return meaningful results
+    rather than an empty window when the last commit was months/years ago.
 
-    Handles subdirectory repos (e.g. myorg/client where .git is at myorg/):
-    detects git root, computes path prefix, strips it from numstat output
-    so file lookups match os.path.relpath(filepath, repo_path).
+    Falls back to wall-clock anchor if the repo has no commits.
 
-    Stats are DISPLAY ONLY — not fed into the risk model.
-    Returns: {rel_filepath: {la, ld, nf, ndev, age_days, ent, messages}}
+    Returns: ({rel_filepath: {la, ld, nf, ndev, age_days, ent, messages}}, window_label)
+    where window_label is a human-readable "YYYY-MM-DD → YYYY-MM-DD" string.
     """
     # Resolve true git root (may be a parent of repo_path)
     git_root = subprocess.run(
@@ -592,7 +612,22 @@ def get_repo_git_stats(repo_path: str) -> dict:
     rel_from_root = os.path.relpath(repo_path, git_root)
     path_prefix   = "" if rel_from_root == "." else rel_from_root.replace(os.sep, "/") + "/"
 
-    since_flag = f"--since={ANALYSIS_WINDOW_DAYS} days ago"
+    # Anchor window to the repo's latest commit, not wall-clock now.
+    latest_ts_str = subprocess.run(
+        ["git", "-C", repo_path, "log", "-1", "--format=%at"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    import datetime
+    if latest_ts_str.isdigit():
+        latest_dt = datetime.datetime.fromtimestamp(int(latest_ts_str))
+    else:
+        latest_dt = datetime.datetime.now()  # fallback: empty repo
+
+    since_dt   = latest_dt - datetime.timedelta(days=ANALYSIS_WINDOW_DAYS)
+    since_flag = f"--since={since_dt.strftime('%Y-%m-%d')}"
+    until_flag = f"--until={latest_dt.strftime('%Y-%m-%d')}"
+    window_label = f"{since_dt.strftime('%Y-%m-%d')} → {latest_dt.strftime('%Y-%m-%d')}"
 
     # Use ASCII record separator (0x1e) before each commit so blank lines
     # in numstat output never confuse the parser.
@@ -600,7 +635,7 @@ def get_repo_git_stats(repo_path: str) -> dict:
         ["git", "-C", repo_path, "log",
          "--format=%x1eCOMMIT\t%H\t%ae\t%at\t%s",
          "--numstat", "--diff-filter=AM",
-         since_flag, "--", "."],
+         since_flag, until_flag, "--", "."],
         capture_output=True, text=True, errors="replace",
     )
 
@@ -662,7 +697,7 @@ def get_repo_git_stats(repo_path: str) -> dict:
             "ndev": ndev, "age_days": round(age_days, 1),
             "ent": round(ent, 3), "messages": messages,
         }
-    return result
+    return result, window_label
 
 
 def get_source_files(repo_path: str) -> list[str]:
@@ -683,7 +718,6 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
     print("\n" + "=" * 62)
     print("  GOMI — Technical Debt Risk Analyzer")
     print(f"  Repo : {repo_path}")
-    print(f"  Window: last {ANALYSIS_WINDOW_DAYS} days (~6 months)")
     print(f"  Min commits for scoring: {MIN_COMMITS_FOR_SCORE}")
     print("=" * 62)
 
@@ -705,14 +739,15 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
     # ── Layer 3 training: DeepJIT + ApacheJIT ─────────────────────────────────
     print("\n[2/5] Training risk model (DeepJIT + ApacheJIT)...")
     _t = time.perf_counter()
-    risk_model, X_train = train_risk_model(sentiment_clf)
+    risk_model, X_train, imputer = train_risk_model(sentiment_clf)
     timings.append(("Risk model train/load", time.perf_counter() - _t))
 
-    # ── Git history (6-month window) ──────────────────────────────────────────
-    print(f"\n[3/5] Extracting git history (last {ANALYSIS_WINDOW_DAYS} days)...")
+    # ── Git history (latest 6-month window) ──────────────────────────────────
+    print(f"\n[3/5] Extracting git history (latest {ANALYSIS_WINDOW_DAYS}-day window)...")
     _t = time.perf_counter()
-    git_stats = get_repo_git_stats(repo_path)
+    git_stats, window_label = get_repo_git_stats(repo_path)
     timings.append(("Git history extract", time.perf_counter() - _t))
+    print(f"  Window : {window_label}")
     print(f"  Git history covers {len(git_stats)} tracked files in window")
 
     # ── Layer 2: Lizard complexity on all source files ─────────────────────────
@@ -732,8 +767,9 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
         raw_todos[rel] = count_todo_comments(fp)
     timings.append(("Lizard + TODO scan", time.perf_counter() - _t))
 
-    # Repo-relative normalization: AvgCCN percentile rank within this repo
-    all_ccn = [m["AvgCCN"] for m in raw_complexity.values()]
+    # Repo-relative normalization: AvgCCN and AvgNLOC percentile ranks within this repo
+    all_ccn  = [m["AvgCCN"]  for m in raw_complexity.values()]
+    all_nloc = [m["AvgNLOC"] for m in raw_complexity.values()]
 
     # Change entropy: percentile-ranked within this repo (ent already in git_stats)
     all_ent_vals = [s.get("ent", 0.0) for s in git_stats.values()]
@@ -765,12 +801,21 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
             if all_ent_vals else 0.0
         )
 
-        # Layer 3: Logistic Regression risk score — complexity is display-only
         satd_density = (
             float(np.mean([compute_msg_satd_density(m) for m in msgs]))
             if msgs else 0.0
         )
-        X_file     = np.array([[sentiment_score, low_info_ratio, change_entropy, satd_density]])
+        # AvgNLOC percentile rank mirrors training-time lt_normalized (both measure
+        # file size relative to codebase).
+        lt_normalized = percentile_rank(raw_complexity[rel]["AvgNLOC"], all_nloc)
+
+        X_file = imputer.transform(np.array([[
+            sentiment_score,
+            low_info_ratio,
+            change_entropy,
+            satd_density,
+            lt_normalized,
+        ]]))
         risk_score = float(risk_model.predict_proba(X_file)[0][1])
 
         # Layer 4: SHAP breakdown
@@ -778,11 +823,12 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
             shap_out = compute_shap(risk_model, X_train, X_file)
         except Exception:
             shap_out = {
-                "base_rate": 0.0,
-                "sentiment_contrib": 0.0,
-                "low_info_contrib": 0.0,
-                "entropy_contrib": 0.0,
-                "satd_contrib": 0.0,
+                "base_rate":          0.0,
+                "sentiment_contrib":  0.0,
+                "low_info_contrib":   0.0,
+                "entropy_contrib":    0.0,
+                "satd_contrib":       0.0,
+                "complexity_contrib": 0.0,
             }
 
         results.append({
@@ -792,6 +838,7 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
             "low_info_ratio":    low_info_ratio,
             "change_entropy":    change_entropy,
             "satd_density":      satd_density,
+            "lt_normalized":     lt_normalized,
             "risk_score":        risk_score,
             "shap":              shap_out,
             "commits":           breakdown,
@@ -845,7 +892,7 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
         shap_d = r["shap"]
         approx = (shap_d["base_rate"] + shap_d["sentiment_contrib"] +
                   shap_d["low_info_contrib"] + shap_d["entropy_contrib"] +
-                  shap_d["satd_contrib"])
+                  shap_d["satd_contrib"] + shap_d["complexity_contrib"])
         line("SHAP breakdown (LR inputs only):")
         line(f"  base_rate          {shap_d['base_rate']:+.4f}")
         line(f"  sentiment_contrib  {shap_d['sentiment_contrib']:+.4f}"
@@ -856,6 +903,8 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
              f"   (change_entropy = {r['change_entropy']:.3f})")
         line(f"  satd_contrib       {shap_d['satd_contrib']:+.4f}"
              f"   (satd_density = {r['satd_density']:.3f})")
+        line(f"  complexity_contrib {shap_d['complexity_contrib']:+.4f}"
+             f"   (lt_normalized / AvgNLOC = {r['lt_normalized']:.3f})")
         line(f"  {'─' * 28}")
         line(f"  ≈ risk score       {approx:+.4f}")
 
@@ -893,7 +942,7 @@ def run_gomi(repo_path: str, top_n: int = 10) -> None:
         print(f"├{'─' * W}┤")
         line("Commit sentiment (DistilBERT):")
         if r["commits"]:
-            for msg, emotion in r["commits"][:4]:
+            for msg, emotion, _ in r["commits"][:4]:
                 short = (msg[:43] + "...") if len(msg) > 46 else msg
                 line(f"  [{emotion:<12}] {short}")
         else:
