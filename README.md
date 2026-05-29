@@ -6,12 +6,12 @@ Technical debt risk analyzer for git repositories. Combines DistilBERT commit-me
 
 | Layer | What                   | Input                                                                                |
 | ----- | ---------------------- | ------------------------------------------------------------------------------------ |
-| 1     | DistilBERT sentiment   | Commit messages → Frustration / Caution / Neutral / Satisfaction                     |
-| 2     | Lizard static analysis | Source files → AvgCCN, AvgNLOC, function count (display only)                        |
-| 3     | Logistic Regression    | `[sentiment_score, low_info_ratio, change_entropy, satd_density]` → risk probability |
-| 4     | SHAP LinearExplainer   | Decomposes risk score into per-feature contributions                                 |
+| 1     | DistilBERT sentiment   | Commit messages → soft P(frustration)+P(caution) per commit                                          |
+| 2     | Lizard static analysis | Source files → AvgCCN, AvgNLOC, function count (display only)                                        |
+| 3     | Logistic Regression    | `[sentiment_score, low_info_ratio, change_entropy, satd_density, lt_normalized]` → risk probability  |
+| 4     | SHAP LinearExplainer   | Decomposes risk score into per-feature contributions                                                  |
 
-Analysis window: last 6 months of git history. Files with fewer than 10 commits are flagged low-confidence.
+Analysis window: most recent 6 months of the repo's own commit history (anchored to latest commit, not wall clock). Files with fewer than 10 commits are flagged low-confidence.
 
 ---
 
@@ -46,7 +46,7 @@ All datasets go in `scripts/datasets/`.
 | `qt_test_raw.pkl` … `platform_test_raw.pkl` | [DeepJIT (ISSTA21)](https://github.com/ZZR0/ISSTA21-JIT-DP)   | LR training              |
 | `apachejit_commits.csv`                     | [Zenodo 5907002](https://zenodo.org/records/5907002)          | LR training + validation |
 
-DeepJIT pkl files: `qt`, `openstack`, `go`, `jdt`, `gerrit`, `platform` — each as `<name>_test_raw.pkl`. Entropy feature files (`<name>_k_feature.csv`) are optional but improve the model.
+DeepJIT pkl files: `qt`, `openstack`, `go`, `jdt`, `gerrit`, `platform` — each as `<name>_test_raw.pkl`. Feature files (`<name>_k_feature.csv`) are optional but add `change_entropy` and `lt_normalized` training features.
 
 Required CSV columns:
 
@@ -59,15 +59,15 @@ Required CSV columns:
 
 Run once, in order. Each step is a prerequisite for the next.
 
-### Step 1 — MLM domain pre-training (optional but recommended)
+### Step 1 — Vocabulary adaptation via FVT (optional but recommended)
 
-Pre-trains DistilBERT on raw commit messages from DeepJIT + ApacheJIT before fine-tuning. Saves to `scripts/datasets/distilbert_commit_mlm/`. `train_sentiment.py` auto-detects this directory.
+Identifies high-frequency commit tokens fragmented by DistilBERT's WordPiece tokenizer, adds them to the vocabulary, and initializes their embeddings as the mean of their subword fragment embeddings (Fast Vocabulary Transfer). Saves to `scripts/datasets/distilbert_adapted/`. `train_sentiment.py` auto-detects this directory.
 
 ```sh
-uv run python scripts/pretrain_mlm.py
+uv run python scripts/adapt_vocab.py
 ```
 
-~2000 training steps. Requires GPU for reasonable speed (~20 min on GPU, several hours on CPU).
+Runs in minutes on CPU. No GPU required.
 
 ### Step 2 — Fine-tune DistilBERT sentiment model
 
@@ -117,8 +117,9 @@ Drilldown for top 5 files includes:
   low_info_contrib   -0.0412   (low_info_ratio = 0.200)
   entropy_contrib    +0.1203   (change_entropy = 0.812)
   satd_contrib       +0.0334   (satd_density = 0.043)
+  complexity_contrib +0.0198   (lt_normalized / AvgNLOC = 0.731)
   ────────────────────────────
-  ≈ risk score       +0.7068
+  ≈ risk score       +0.7266
 ```
 
 ---
@@ -134,6 +135,6 @@ rm scripts/datasets/risk_model.joblib
 # Force DistilBERT retrain (slow — requires GPU)
 rm -rf scripts/datasets/distilbert_sentiment/
 
-# Force MLM pre-training (slowest)
-rm -rf scripts/datasets/distilbert_commit_mlm/
+# Force vocabulary re-adaptation
+rm -rf scripts/datasets/distilbert_adapted/
 ```
